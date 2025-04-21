@@ -1,3 +1,6 @@
 [submodule "submodules/simple-knn"]
 	path = submodules/simple-knn
 	url = https://gitlab.inria.fr/bkerbl/simple-knn.git
+[submodule "submodules/diff-gabor-rasterization"]
+	path = submodules/diff-gabor-rasterization
+	url = https://github.com/haato-w/diff-gabor-rasterization.git

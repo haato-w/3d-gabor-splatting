@@ -11,12 +11,12 @@
 
 import torch
 import math
-from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from scene.gaussian_model import GaussianModel
+from diff_gabor_rasterization import GaborRasterizationSettings, GaborRasterizer
+from scene.gabor_model import GaborModel
 from utils.sh_utils import eval_sh
 from utils.point_utils import depth_to_normal
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaborModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
     """
     Render the scene. 
     
@@ -34,7 +34,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-    raster_settings = GaussianRasterizationSettings(
+    raster_settings = GaborRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
@@ -50,11 +50,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # pipe.debug
     )
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    rasterizer = GaborRasterizer(raster_settings=raster_settings)
 
     means3D = pc.get_xyz
     means2D = screenspace_points
     opacity = pc.get_opacity
+    weights_for_frequency_angle = pc.get_weights_for_frequency_angle
+    frequency_lengths = pc.get_frequency_lengths
+    phases = pc.get_phases
 
     # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
     # scaling / rotation by the rasterizer.
@@ -81,31 +84,43 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
     pipe.convert_SHs_python = False
     shs = None
+    shs2 = None
     colors_precomp = None
+    colors_precomp2 = None
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            shs_view2 = pc.get_features2.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            sh2rgb2 = eval_sh(pc.active_sh_degree, shs_view2, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            colors_precomp2 = torch.clamp_min(sh2rgb2 + 0.5, 0.0)
         else:
             shs = pc.get_features
+            shs2 = pc.get_features2
     else:
         colors_precomp = override_color
+        colors_precomp2 = override_color
     
     rendered_image, radii, allmap = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
+        shs2 = shs2,
         colors_precomp = colors_precomp,
+        colors_precomp2 = colors_precomp2,
         opacities = opacity,
+        weights_for_frequency_angle = weights_for_frequency_angle, 
+        frequency_lengths = frequency_lengths, 
+        phases = phases, 
         scales = scales,
         rotations = rotations,
         cov3D_precomp = cov3D_precomp
     )
     
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # Those Gabors that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
     rets =  {"render": rendered_image,
             "viewspace_points": means2D,

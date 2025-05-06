@@ -21,7 +21,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 
-class GaussianModel:
+class GaborModel:
 
     def setup_functions(self):
         def build_covariance_from_scaling_rotation(center, scaling, scaling_modifier, rotation):
@@ -42,11 +42,17 @@ class GaussianModel:
 
 
     def __init__(self, sh_degree : int):
+        self.F = 4 # the number of frequency candidates
         self.active_sh_degree = 0
-        self.max_sh_degree = sh_degree  
+        self.max_sh_degree = 0 # Omitting sh!
         self._xyz = torch.empty(0)
+        self._weights_for_frequency_angle = torch.empty(0)
+        self._frequency_lengths = torch.empty(0)
+        self._phases = torch.empty(0)
         self._features_dc = torch.empty(0)
+        self._features_dc2 = torch.empty(0)
         self._features_rest = torch.empty(0)
+        self._features_rest2 = torch.empty(0)
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
@@ -62,8 +68,13 @@ class GaussianModel:
         return (
             self.active_sh_degree,
             self._xyz,
+            self._weights_for_frequency_angle, 
+            self._frequency_lengths, 
+            self._phases, 
             self._features_dc,
+            self._features_dc2,
             self._features_rest,
+            self._features_rest2,
             self._scaling,
             self._rotation,
             self._opacity,
@@ -77,8 +88,13 @@ class GaussianModel:
     def restore(self, model_args, training_args):
         (self.active_sh_degree, 
         self._xyz, 
+        self._weights_for_frequency_angle, 
+        self._frequency_lengths, 
+        self._phases, 
         self._features_dc, 
+        self._features_dc2, 
         self._features_rest,
+        self._features_rest2,
         self._scaling, 
         self._rotation, 
         self._opacity,
@@ -105,10 +121,28 @@ class GaussianModel:
         return self._xyz
     
     @property
+    def get_weights_for_frequency_angle(self):
+        return self._weights_for_frequency_angle
+    
+    @property
+    def get_frequency_lengths(self):
+        return self._frequency_lengths
+    
+    @property
+    def get_phases(self):
+        return self._phases
+    
+    @property
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
         return torch.cat((features_dc, features_rest), dim=1)
+    
+    @property
+    def get_features2(self):
+        features_dc2 = self._features_dc2
+        features_rest2 = self._features_rest2
+        return torch.cat((features_dc2, features_rest2), dim=1)
     
     @property
     def get_opacity(self):
@@ -125,9 +159,17 @@ class GaussianModel:
         self.spatial_lr_scale = spatial_lr_scale
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+        fused_color2 = RGB2SH(torch.zeros((fused_color.shape[0], 3)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
+        features2 = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features2[:, :3, 0 ] = fused_color2
+        features2[:, 3:, 1:] = 0.0
+
+        weights_for_frequency_angle = 0.1 * torch.rand((fused_color.shape[0], self.F)).float().cuda()
+        frequency_lengths = 1.0 * torch.rand((fused_color.shape[0], self.F)).float().cuda()
+        phases = 1.0 * torch.rand((fused_color.shape[0], self.F)).float().cuda()
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
@@ -139,10 +181,15 @@ class GaussianModel:
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dc2 = nn.Parameter(features2[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest2 = nn.Parameter(features2[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._weights_for_frequency_angle = nn.Parameter(weights_for_frequency_angle.requires_grad_(True))
+        self._frequency_lengths = nn.Parameter(frequency_lengths.requires_grad_(True))
+        self._phases = nn.Parameter(phases.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
     def training_setup(self, training_args):
@@ -152,8 +199,13 @@ class GaussianModel:
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
+            {'params': [self._weights_for_frequency_angle], 'lr': training_args.weights_for_frequency_angle_lr, "name": "weights_for_frequency_angle"},
+            {'params': [self._frequency_lengths], 'lr': training_args.frequency_lengths_lr, "name": "frequency_lengths"},
+            {'params': [self._phases], 'lr': training_args.phases_lr, "name": "phases"},
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
+            {'params': [self._features_dc2], 'lr': training_args.feature_lr, "name": "f_dc2"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
+            {'params': [self._features_rest2], 'lr': training_args.feature_lr / 20.0, "name": "f_rest2"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
@@ -178,9 +230,19 @@ class GaussianModel:
         # All channels except the 3 DC
         for i in range(self._features_dc.shape[1]*self._features_dc.shape[2]):
             l.append('f_dc_{}'.format(i))
+        for i in range(self._features_dc2.shape[1]*self._features_dc2.shape[2]):
+            l.append('f_dc2_{}'.format(i))
         for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
             l.append('f_rest_{}'.format(i))
+        for i in range(self._features_rest2.shape[1]*self._features_rest2.shape[2]):
+            l.append('f_rest2_{}'.format(i))
         l.append('opacity')
+        for i in range(self._weights_for_frequency_angle.shape[1]):
+            l.append('weights_for_frequency_angle_{}'.format(i))
+        for i in range(self._frequency_lengths.shape[1]):
+            l.append('frequency_lengths_{}'.format(i))
+        for i in range(self._phases.shape[1]):
+            l.append('phases_{}'.format(i))
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -193,15 +255,20 @@ class GaussianModel:
         xyz = self._xyz.detach().cpu().numpy()
         normals = np.zeros_like(xyz)
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_dc2 = self._features_dc2.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        f_rest2 = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
+        weights_for_frequency_angle = self._weights_for_frequency_angle.detach().cpu().numpy()
+        frequency_lengths = self._frequency_lengths.detach().cpu().numpy()
+        phases = self._phases.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_dc2, f_rest, f_rest2, opacities, weights_for_frequency_angle, frequency_lengths, phases, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -219,10 +286,30 @@ class GaussianModel:
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
 
+        weights_for_frequency_angle_list = []
+        for i in range(self.F):
+            weights_for_frequency_angle_list.append(np.asarray(plydata.elements[0]["weights_for_frequency_angle_{}".format(i)]))
+        weights_for_frequency_angle = np.stack(weights_for_frequency_angle_list, axis=1)
+
+        frequency_lengths_list = []
+        for i in range(self.F):
+            frequency_lengths_list.append(np.asarray(plydata.elements[0]["frequency_lengths_{}".format(i)]))
+        frequency_lengths = np.stack(frequency_lengths_list, axis=1)
+
+        phases_list = []
+        for i in range(self.F):
+            phases_list.append(np.asarray(plydata.elements[0]["phases_{}".format(i)]))
+        phases = np.stack(phases_list, axis=1)
+
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
         features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
         features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
+
+        features_dc2 = np.zeros((xyz.shape[0], 3, 1))
+        features_dc2[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc2_0"])
+        features_dc2[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc2_1"])
+        features_dc2[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc2_2"])
 
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
@@ -232,6 +319,15 @@ class GaussianModel:
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
+
+        extra_f_names2 = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
+        extra_f_names2 = sorted(extra_f_names2, key = lambda x: int(x.split('_')[-1]))
+        assert len(extra_f_names2)==3*(self.max_sh_degree + 1) ** 2 - 3
+        features_extra2 = np.zeros((xyz.shape[0], len(extra_f_names2)))
+        for idx, attr_name in enumerate(extra_f_names2):
+            features_extra2[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
+        features_extra2 = features_extra2.reshape((features_extra2.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
         scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
@@ -246,8 +342,13 @@ class GaussianModel:
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._weights_for_frequency_angle = nn.Parameter(torch.tensor(weights_for_frequency_angle, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._frequency_lengths = nn.Parameter(torch.tensor(frequency_lengths, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._phases = nn.Parameter(torch.tensor(phases, dtype=torch.float, device="cuda").requires_grad_(True))
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_dc2 = nn.Parameter(torch.tensor(features_dc2, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+        self._features_rest2 = nn.Parameter(torch.tensor(features_extra2, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -293,8 +394,13 @@ class GaussianModel:
 
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
+        self._features_dc2 = optimizable_tensors["f_dc2"]
         self._features_rest = optimizable_tensors["f_rest"]
+        self._features_rest2 = optimizable_tensors["f_rest2"]
         self._opacity = optimizable_tensors["opacity"]
+        self._weights_for_frequency_angle = optimizable_tensors["weights_for_frequency_angle"]
+        self._frequency_lengths = optimizable_tensors["frequency_lengths"]
+        self._phases = optimizable_tensors["phases"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -325,19 +431,42 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
+    def densification_postfix(
+        self, 
+        new_xyz, 
+        new_features_dc, 
+        new_features_dc2, 
+        new_features_rest, 
+        new_features_rest2, 
+        new_opacities, 
+        new_weights_for_frequency_angle, 
+        new_frequency_lengths, 
+        new_phases, 
+        new_scaling, 
+        new_rotation
+    ):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
+        "f_dc2": new_features_dc2,
         "f_rest": new_features_rest,
+        "f_rest2": new_features_rest2,
         "opacity": new_opacities,
+        "weights_for_frequency_angle": new_weights_for_frequency_angle, 
+        "frequency_lengths": new_frequency_lengths, 
+        "phases": new_phases, 
         "scaling" : new_scaling,
         "rotation" : new_rotation}
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._features_dc = optimizable_tensors["f_dc"]
+        self._features_dc2 = optimizable_tensors["f_dc2"]
         self._features_rest = optimizable_tensors["f_rest"]
+        self._features_rest2 = optimizable_tensors["f_rest2"]
         self._opacity = optimizable_tensors["opacity"]
+        self._weights_for_frequency_angle = optimizable_tensors["weights_for_frequency_angle"]
+        self._frequency_lengths = optimizable_tensors["frequency_lengths"]
+        self._phases = optimizable_tensors["phases"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -363,10 +492,27 @@ class GaussianModel:
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N,1) / (0.8*N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N,1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
+        new_features_dc2 = self._features_dc2[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
+        new_features_rest2 = self._features_rest2[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_weights_for_frequency_angle = self._weights_for_frequency_angle[selected_pts_mask].repeat(N,1)
+        new_frequency_lengths = self._frequency_lengths[selected_pts_mask].repeat(N,1)
+        new_phases = self._phases[selected_pts_mask].repeat(N,1)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
+        self.densification_postfix(
+            new_xyz, 
+            new_features_dc, 
+            new_features_dc2, 
+            new_features_rest, 
+            new_features_rest2, 
+            new_opacity, 
+            new_weights_for_frequency_angle, 
+            new_frequency_lengths, 
+            new_phases, 
+            new_scaling, 
+            new_rotation
+        )
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -379,12 +525,29 @@ class GaussianModel:
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_dc2 = self._features_dc2[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
+        new_features_rest2 = self._features_rest2[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
+        new_weights_for_frequency_angle = self._weights_for_frequency_angle[selected_pts_mask]
+        new_frequency_lengths = self._frequency_lengths[selected_pts_mask]
+        new_phases = self._phases[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation)
+        self.densification_postfix(
+            new_xyz, 
+            new_features_dc, 
+            new_features_dc2, 
+            new_features_rest, 
+            new_features_rest2,  
+            new_opacities, 
+            new_weights_for_frequency_angle, 
+            new_frequency_lengths, 
+            new_phases, 
+            new_scaling, 
+            new_rotation
+        )
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
         grads = self.xyz_gradient_accum / self.denom

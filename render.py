@@ -14,12 +14,12 @@ from scene import Scene
 import os
 from tqdm import tqdm
 from os import makedirs
-from gaussian_renderer import render
+from gabor_renderer import render
 import torchvision
 from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
-from gaussian_renderer import GaussianModel
+from gabor_renderer import GaborModel
 from utils.mesh_utils import GaussianExtractor, to_cam_open3d, post_process_mesh
 from utils.render_utils import generate_path, create_videos
 
@@ -47,14 +47,14 @@ if __name__ == "__main__":
 
 
     dataset, iteration, pipe = model.extract(args), args.iteration, pipeline.extract(args)
-    gaussians = GaussianModel(dataset.sh_degree)
-    scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
+    gabors = GaborModel(dataset.sh_degree)
+    scene = Scene(dataset, gabors, load_iteration=iteration, shuffle=False)
     bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
     
     train_dir = os.path.join(args.model_path, 'train', "ours_{}".format(scene.loaded_iter))
     test_dir = os.path.join(args.model_path, 'test', "ours_{}".format(scene.loaded_iter))
-    gaussExtractor = GaussianExtractor(gaussians, render, pipe, bg_color=bg_color)    
+    gaussExtractor = GaussianExtractor(gabors, render, pipe, bg_color=bg_color)    
     
     if not args.skip_train:
         print("export training images ...")
